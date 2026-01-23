@@ -82,7 +82,8 @@ def query_openrouter(model, messages, temperature=0.1):
 # --- UPDATED: Robust Google Native Vision Logic ---
 def get_visual_description_native(image, audience):
     """
-    Uses Google's Native API for Vision with fallback model names.
+    Uses Google's Native API for Vision.
+    INCLUDES: Safety Settings Fix & Detailed Error Logging.
     """
     google_key = st.secrets.get("GOOGLE_API_KEY")
     if not google_key:
@@ -92,31 +93,33 @@ def get_visual_description_native(image, audience):
     try:
         genai.configure(api_key=google_key)
         
-        # List of potential model names to try (Solves the 404 error)
-        model_names = [
-            'gemini-1.5-flash',
-            'gemini-1.5-flash-latest',
-            'gemini-1.5-flash-001',
-            'gemini-pro-vision' # Ultimate fallback
-        ]
+        # 1. Define Model
+        # We use the generic 'gemini-1.5-flash' which aliases to the latest stable version
+        model = genai.GenerativeModel('gemini-1.5-flash')
         
+        # 2. Define Safety Settings (CRITICAL FOR MEDICAL IMAGES)
+        # We must disable blocks on "bodily harm" or it will reject rashes/wounds.
+        safety_settings = [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+        ]
+
         tone = "clinical and precise" if audience == "Clinician" else "simple and descriptive"
         prompt = f"Describe the medical symptom in this image in {tone} terms. Focus on visible dermatological or physical signs. Be concise."
 
-        # Loop through models until one works
-        for m_name in model_names:
-            try:
-                model = genai.GenerativeModel(m_name)
-                response = model.generate_content([prompt, image])
-                return response.text
-            except Exception:
-                continue # Try next model
+        # 3. Generate
+        response = model.generate_content(
+            [prompt, image],
+            safety_settings=safety_settings
+        )
         
-        st.error("Could not connect to any Google Vision models. Please check API Key permissions.")
-        return None
+        return response.text
         
     except Exception as e:
-        st.error(f"Google Vision API Critical Error: {e}")
+        # Detailed error printing for debugging
+        st.error(f"Google Vision API Error Details: {str(e)}")
         return None
 
 # --- Logic Modules ---
