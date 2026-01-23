@@ -8,6 +8,7 @@ from pathlib import Path
 import io
 import base64
 import time
+import itertools  # NEW: For generating drug pairs
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -85,7 +86,6 @@ def query_openrouter(model, messages, temperature=0.1):
 def get_visual_description_native(image, audience):
     """
     Try Google Native first. 
-    UPDATED: Iterates through the newest available models (2.0/2.5/Latest).
     """
     google_key = st.secrets.get("GOOGLE_API_KEY")
     if not google_key: return None
@@ -93,17 +93,16 @@ def get_visual_description_native(image, audience):
     try:
         genai.configure(api_key=google_key)
         
-        # Priority list: Try 3.0/2.5 preview first, then fall back to stable 2.0/Latest
+        # Priority list
         model_candidates = [
-            "gemini-2.0-flash-exp",   # Cutting edge
-            "gemini-2.0-flash",       # Stable 2.0
-            "gemini-flash-latest",    # Always points to newest stable
-            "gemini-1.5-flash-latest" # Old faithful fallback
+            "gemini-2.0-flash-exp",   
+            "gemini-2.0-flash",       
+            "gemini-flash-latest",    
+            "gemini-1.5-flash-latest" 
         ]
         
         prompt = "Analyze this medical image. Describe ONLY the physical appearance (morphology, color, texture). DO NOT diagnose. Be precise."
 
-        # Loop through candidates until one works
         for model_name in model_candidates:
             try:
                 model = genai.GenerativeModel(model_name)
@@ -111,7 +110,7 @@ def get_visual_description_native(image, audience):
                 if response.text:
                     return response.text
             except Exception:
-                continue # Try next model
+                continue 
         
         return None
     except Exception:
@@ -119,83 +118,43 @@ def get_visual_description_native(image, audience):
 
 # --- 3. Translation / Localization Layer ---
 def localize_content(text, target_language):
-    """
-    Translates content using OpenRouter.
-    Uses Gemini 2.0 Flash or Llama 3.3 for best Amharic support.
-    """
-    if target_language == "English":
-        return text
+    if target_language == "English": return text
 
     prompt = f"""
     You are a professional medical translator.
     Translate the following text into {target_language}.
-    
-    RULES:
-    1. Keep drug names in English (Latin script) like "Warfarin".
-    2. Use natural, conversational {target_language}.
-    3. Keep the formatting (bolding, headers).
-    
-    TEXT:
-    {text}
+    RULES: Keep drug names in English. Use natural {target_language}. Keep formatting.
+    TEXT: {text}
     """
-    
     messages = [{"role": "user", "content": prompt}]
-    
-    # Updated to use the newer 2.0 models
     translation = query_openrouter("google/gemini-2.0-flash-exp:free", messages, 0.1)
-    
     if not translation:
-        # Fallback to Llama 3.3 (Excellent multilingual)
         translation = query_openrouter("meta-llama/llama-3.3-70b-instruct", messages, 0.1)
         
     return translation if translation else text
 
 # --- 4. Hybrid Vision Strategy ---
 def get_visual_description_hybrid(pil_image, audience, drugs_list):
-    # 1. Try Google Native
     desc = get_visual_description_native(pil_image, audience)
-    if desc:
-        return desc, "Google Native (Gemini Flash 2.x)"
+    if desc: return desc, "Google Native (Gemini Flash)"
     
-    # 2. Try OpenRouter Fallbacks
     b64_img = image_to_base64(pil_image)
-    
     prompt = f"""
-    You are a medical imaging assistant.
-    The patient is taking: {', '.join(drugs_list)}.
-    
-    TASK: Provide a purely DESCRIPTIVE analysis of the visual symptoms.
-    RESTRICTIONS:
-    1. Do NOT diagnose the condition.
-    2. Do NOT mention specific drugs or causes.
-    3. Describe ONLY visible features: Color, Texture, Distribution.
-    4. Ignore clothing and background.
+    Medical Imaging Assistant. Patient meds: {', '.join(drugs_list)}.
+    TASK: Descriptive analysis only. No diagnosis. Describe visible features (Color, Texture).
     """
+    messages = [{"role": "user", "content": [{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}]}]
     
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
-            ]
-        }
-    ]
-    
-    # UPDATED FALLBACK LIST (Newest Models)
     fallback_models = [
-        "google/gemini-2.0-flash-exp:free",        # 1. Gemini 2.0 (Fast & Free on OR)
-        "google/gemini-2.0-flash-001",             # 2. Gemini 2.0 Stable
-        "rhymes-ai/ovis-1.6-gemma-2-9b",           # 3. OVIS (Gemma-based!)
-        "qwen/qwen2.5-vl-72b-instruct",            # 4. Qwen 2.5 (SOTA Open Source)
-        "meta-llama/llama-3.2-11b-vision-instruct" # 5. Llama 3.2 (Reliable)
+        "google/gemini-2.0-flash-exp:free", "google/gemini-2.0-flash-001",
+        "rhymes-ai/ovis-1.6-gemma-2-9b", "qwen/qwen2.5-vl-72b-instruct",
+        "meta-llama/llama-3.2-11b-vision-instruct"
     ]
     
     for model in fallback_models:
         st.write(f"🔄 Trying model: `{model}`...") 
         desc = query_openrouter(model, messages)
-        if desc:
-            return desc, f"OpenRouter ({model})"
+        if desc: return desc, f"OpenRouter ({model})"
             
     return None, "All Providers Failed"
 
@@ -211,6 +170,7 @@ def extract_entities(text):
     except: return [text], []
 
 def query_ddi_db(d1, d2):
+    """Pairwise DB check"""
     if not db_path: return "Unknown"
     conn = sqlite3.connect(db_path)
     c = conn.cursor()
@@ -219,23 +179,66 @@ def query_ddi_db(d1, d2):
     conn.close()
     return res[0] if res else "Unknown"
 
-def analyze_symptom_causality(drugs, symptoms, visual_context, audience, language):
-    # STRICTER PERSONA DEFINITION
+# --- NEW: Multi-Drug Interaction Logic ---
+def analyze_multidrug_interactions(drug_list, language, audience):
+    # 1. Generate Pairs
+    pairs = list(itertools.combinations(drug_list, 2))
+    findings = []
+    
+    # 2. Check DB for each pair
+    for d1, d2 in pairs:
+        level = query_ddi_db(d1, d2)
+        findings.append(f"- {d1} + {d2}: {level}")
+    
+    findings_str = "\n".join(findings)
+    
+    # 3. Generate Report with STRONG System Persona to prevent refusal
     if audience == "Patient":
-        role = "Caring Triage Nurse"
-        tone_instruction = """
-        CRITICAL INSTRUCTION FOR PATIENT MODE:
-        1. Speak in simple, everyday language (5th-grade reading level).
-        2. DO NOT use words like "Erythema Multiforme", "Stevens-Johnson Syndrome", or "Pharmacovigilance".
-        3. Instead of "Erythema", say "Redness". Instead of "Discontinue", say "Stop taking".
-        4. Focus ONLY on: Is it dangerous? What should I do right now?
-        5. Be empathetic but direct.
+        prompt = f"""
+        You are a Medical Safety Assistant.
+        Analyze these medications: {', '.join(drug_list)}.
+        
+        Database Findings:
+        {findings_str}
+        
+        TASK: Explain these interactions to a patient in simple language.
+        1. List the risks (if any).
+        2. Explain what to watch out for.
+        3. Do NOT refuse to answer. Provide educational safety information.
         """
     else:
-        role = "Clinical Pharmacologist"
-        tone_instruction = """
-        Use professional medical terminology. Discuss Differential Diagnosis, Pharmacokinetics, and Clinical Management guidelines.
+        prompt = f"""
+        You are a Clinical Decision Support System (CDSS) for Pharmacologists.
+        
+        Medication List: {', '.join(drug_list)}
+        
+        Database Flags:
+        {findings_str}
+        
+        TASK: Provide a theoretical pharmacological analysis of this regimen.
+        1. Analyze Pharmacokinetic interactions (CYP450 enzymes, transporters).
+        2. Analyze Pharmacodynamic interactions (additive effects, QT prolongation, etc.).
+        3. Provide clinical management recommendations.
+        4. Output strictly clinical data. Do NOT include generic AI disclaimers.
         """
+        
+    messages = [{"role": "user", "content": prompt}]
+    
+    # Run Analysis
+    report = query_openrouter(GEMMA_MODEL_ID, messages, 0.2)
+    
+    # Localize
+    if language != "English" and report:
+        return localize_content(report, language)
+    return report
+
+def analyze_symptom_causality(drugs, symptoms, visual_context, audience, language):
+    if audience == "Patient":
+        role = "Caring Triage Nurse"
+        tone_instruction = "Speak in simple, everyday language (5th-grade level). Focus on safety and next steps."
+    else:
+        role = "Clinical Pharmacologist"
+        tone_instruction = "Use professional medical terminology. Discuss Differential Diagnosis and Pharmacokinetics."
 
     prompt = f"""
     Role: {role}.
@@ -250,33 +253,17 @@ def analyze_symptom_causality(drugs, symptoms, visual_context, audience, languag
     
     **Output Structure:**
     1. **Triage Status:** (EMERGENCY / WARNING / MONITOR)
-    2. **What is happening?:** (Simple explanation for patient / Technical for doctor)
+    2. **Analysis:** (Explanation)
     3. **Next Steps:** (Actionable advice)
     """
     messages = [{"role": "system", "content": f"You are a {role}."}, {"role": "user", "content": prompt}]
     
-    # 1. Generate English Reasoning
     english_analysis = query_openrouter(GEMMA_MODEL_ID, messages, 0.2)
     
-    # 2. Localize via OpenRouter (Bypasses Google Native Block)
     if language != "English" and english_analysis:
         return localize_content(english_analysis, language)
     
     return english_analysis
-
-def analyze_interaction_report(d1, d2, level, lang, audience):
-    if audience == "Patient":
-        prompt = f"Explain interaction between {d1} and {d2} (Level: {level}) to a patient. Simple language. Safety focus."
-    else:
-        prompt = f"Create clinical interaction report for {d1} & {d2}. Level: {level}. Include mechanism."
-        
-    messages = [{"role": "user", "content": prompt}]
-    english_report = query_openrouter(GEMMA_MODEL_ID, messages, 0.2)
-    
-    if lang != "English" and english_report:
-        return localize_content(english_report, lang)
-    
-    return english_report
 
 # --- UI ---
 with st.sidebar:
@@ -289,19 +276,32 @@ with st.sidebar:
 st.markdown('<div class="main-header">🩺 Med-GemMA Safety Hub</div>', unsafe_allow_html=True)
 tab1, tab2 = st.tabs(["💊 Interaction Checker", "📸 Visual Symptom Analyzer"])
 
+# --- TAB 1: MULTI-DRUG CHECKER (UPDATED) ---
 with tab1:
-    col1, col2 = st.columns(2)
-    with col1: d1 = st.text_input("First Medication", placeholder="e.g. Warfarin")
-    with col2: d2 = st.text_input("Second Medication", placeholder="e.g. Aspirin")
-    if st.button("Check", key="btn1"):
-        if d1 and d2:
-            with st.spinner(f"Analyzing..."):
-                lvl = query_ddi_db(d1, d2)
-                rep = analyze_interaction_report(d1, d2, lvl, language, target_audience)
-                color = "red" if "major" in lvl.lower() else "green"
-                st.markdown(f"**Risk:** :{color}[{lvl.upper()}]")
-                st.success(rep)
+    st.markdown(f"#### Check for Polypharmacy Interactions ({target_audience} Mode)")
+    
+    # Changed to Text Area for Multi-Drug input
+    drug_input = st.text_area("Enter Medication List (comma separated)", placeholder="e.g. Azithromycin, Chloroquine, Ibuprofen", height=80)
+    
+    if st.button("Check Interactions", key="btn1"):
+        if drug_input:
+            with st.spinner(f"Analyzing Regimen..."):
+                # 1. Parse List
+                # Clean up input: split by comma, strip whitespace
+                d_list = [d.strip() for d in drug_input.split(",") if d.strip()]
+                
+                if len(d_list) < 2:
+                    st.warning("Please enter at least two medications to check for interactions.")
+                else:
+                    st.info(f"Analyzing regimen: {', '.join(d_list)}")
+                    
+                    # 2. Run Multi-Drug Analysis
+                    report = analyze_multidrug_interactions(d_list, language, target_audience)
+                    
+                    st.markdown("### Safety Report")
+                    st.success(report)
 
+# --- TAB 2: VISUAL SYMPTOM ANALYZER ---
 with tab2:
     c1, c2 = st.columns([1,1])
     with c1:
