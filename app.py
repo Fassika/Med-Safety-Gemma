@@ -48,11 +48,8 @@ def download_file_from_hf(repo_id: str, filename: str, dest_path: str = "."):
 db_path = download_file_from_hf(DATA_REPO_ID, DB_FILENAME)
 
 def image_to_base64(pil_image):
-    """Convert PIL image to base64 for OpenRouter fallback"""
     buffered = io.BytesIO()
-    # Convert RGBA to RGB if necessary
-    if pil_image.mode == 'RGBA':
-        pil_image = pil_image.convert('RGB')
+    if pil_image.mode == 'RGBA': pil_image = pil_image.convert('RGB')
     pil_image.save(buffered, format="JPEG")
     return base64.b64encode(buffered.getvalue()).decode('utf-8')
 
@@ -73,45 +70,67 @@ def query_openrouter(model, messages, temperature=0.1):
             "https://openrouter.ai/api/v1/chat/completions",
             headers=headers,
             json={"model": model, "messages": messages, "temperature": temperature},
-            timeout=45 # Increased timeout for vision models
+            timeout=45
         )
         if response.status_code == 200:
             return response.json()['choices'][0]['message']['content'].strip()
         else:
-            # Print error to console for debugging
-            print(f"Model {model} failed with status {response.status_code}: {response.text}")
+            print(f"Model {model} failed: {response.status_code}")
             return None
     except Exception as e:
         print(f"Exception on {model}: {e}")
         return None
 
 # --- 2. Google Native Vision (Primary Eyes) ---
-def get_visual_description_native(image, audience):
-    """Try Google Native first. Return None if it fails."""
+def get_visual_description_native(image, audience, medical_context):
+    """Try Google Native first with specific medical prompting."""
     google_key = st.secrets.get("GOOGLE_API_KEY")
     if not google_key: return None
 
     try:
         genai.configure(api_key=google_key)
         model = genai.GenerativeModel('gemini-1.5-flash') 
-        tone = "clinical" if audience == "Clinician" else "simple"
-        prompt = f"Describe the medical symptom in this image in {tone} terms. Focus on visible dermatological or physical signs."
+        
+        # Context-Aware Prompt
+        tone = "clinical dermatology" if audience == "Clinician" else "descriptive medical"
+        prompt = f"""
+        **Role:** Medical Imaging Assistant.
+        **Context:** The patient is taking {medical_context} and suspects a side effect.
+        **Task:** Analyze this image for signs of Adverse Drug Reactions (e.g., maculopapular rash, hives, blistering, angioedema).
+        **Instructions:** 
+        1. Ignore clothing, jewelry, or background details.
+        2. Focus strictly on the skin/lesion morphology (color, texture, distribution).
+        3. Use {tone} terminology.
+        """
+        
         response = model.generate_content([prompt, image])
         return response.text
     except Exception:
         return None
 
-# --- 3. Hybrid Strategy Wrapper (Updated with New Models) ---
-def get_visual_description_hybrid(pil_image, audience):
-    # 1. Try Google Native (Best Points)
-    desc = get_visual_description_native(pil_image, audience)
+# --- 3. Hybrid Strategy Wrapper ---
+def get_visual_description_hybrid(pil_image, audience, drugs_list, user_feeling):
+    # Construct Context String for the AI
+    medical_context = f"Drugs: {', '.join(drugs_list)}. Symptoms reported: {user_feeling}"
+    
+    # 1. Try Google Native
+    desc = get_visual_description_native(pil_image, audience, medical_context)
     if desc:
         return desc, "Google Native (Gemini Flash)"
     
     # 2. Try OpenRouter Fallbacks
     b64_img = image_to_base64(pil_image)
-    tone = "clinical" if audience == "Clinician" else "simple"
-    prompt = f"Describe the medical symptom in this image in {tone} terms. Focus on visible dermatological or physical signs."
+    
+    # Context-Aware Prompt for Fallback Models
+    prompt = f"""
+    You are a medical AI assistant.
+    The patient is taking: {', '.join(drugs_list)}.
+    They report: {user_feeling}.
+    
+    Task: Look at this image specifically for clinical signs of a drug reaction (rash, swelling, redness). 
+    CRITICAL: Ignore non-medical details like shirts, wall colors, or jewelry. Focus ONLY on the body/skin.
+    Describe the visual symptoms in detail.
+    """
     
     messages = [
         {
@@ -123,17 +142,15 @@ def get_visual_description_hybrid(pil_image, audience):
         }
     ]
     
-    # The List of Models to Try (In order of reliability/preference)
     fallback_models = [
-        "meta-llama/llama-3.2-11b-vision-instruct", # Best fallback (Fast, Open)
-        "qwen/qwen2.5-vl-32b-instruct",            # Very Strong Vision
-        "google/gemini-flash-1.5",                 # Google via OpenRouter
-        "moonshotai/kimi-vl-a3b-thinking",         # Alternative
-        "google/gemma-3-4b-it"                     # As requested (if available)
+        "meta-llama/llama-3.2-11b-vision-instruct", 
+        "qwen/qwen2.5-vl-32b-instruct",            
+        "google/gemini-flash-1.5",                 
+        "moonshotai/kimi-vl-a3b-thinking"
     ]
     
     for model in fallback_models:
-        st.write(f"🔄 Trying model: `{model}`...") # Visual feedback for user
+        st.write(f"🔄 Trying model: `{model}`...") 
         desc = query_openrouter(model, messages)
         if desc:
             return desc, f"OpenRouter ({model})"
@@ -161,13 +178,18 @@ def query_ddi_db(d1, d2):
     return res[0] if res else "Unknown"
 
 def analyze_symptom_causality(drugs, symptoms, visual_context, audience, language):
-    role = "Empathetic Assistant" if audience == "Patient" else "Clinical Pharmacologist"
+    role = "Empathetic Medical Assistant" if audience == "Patient" else "Clinical Pharmacologist"
     prompt = f"""
     Role: {role}. Language: {language}.
     Drugs: {drugs}. Symptoms: {symptoms}.
-    Visual Findings: {visual_context}
     
-    Analyze if this is an Adverse Drug Reaction, Allergy, or Emergency.
+    **Visual Findings from Image Analysis:** 
+    "{visual_context}"
+    
+    **Task:**
+    Combine the drug info, reported symptoms, and visual findings to assess if this is an Adverse Drug Reaction (ADR).
+    
+    **Output:**
     Return: Triage (EMERGENCY/WARNING/MONITOR), Assessment, Recommendation.
     """
     messages = [{"role": "system", "content": f"You are a {role}."}, {"role": "user", "content": prompt}]
@@ -215,22 +237,32 @@ with tab2:
         if not txt_drugs: st.warning("Enter meds.")
         else:
             with st.status("Processing...", expanded=True) as status:
+                # 1. Extract Text Info FIRST (Critical Change)
                 st.write("🧠 Extracting entities...")
-                drugs, _ = extract_entities(txt_drugs)
+                drugs, symps = extract_entities(txt_drugs)
+                # Combine manual feeling with extracted symptoms
+                if txt_feel: symps.append(txt_feel)
                 
+                # 2. Analyze Image with Context
                 v_ctx = "No image."
                 if img_file:
                     st.write("👁️ Analyzing Image (Hybrid Mode)...")
                     img = Image.open(img_file)
-                    v_desc, source = get_visual_description_hybrid(img, target_audience)
+                    
+                    # Pass the extracted drugs/symptoms to the vision model!
+                    v_desc, source = get_visual_description_hybrid(img, target_audience, drugs, str(symps))
+                    
                     if v_desc:
                         v_ctx = v_desc
                         st.info(f"Visual Findings ({source}): {v_ctx}")
                     else:
                         st.error("Vision analysis failed on all providers.")
                 
+                # 3. Final Synthesis
                 st.write("⚕️ Clinical Synthesis...")
-                ans = analyze_symptom_causality(drugs, [txt_feel] if txt_feel else [], v_ctx, target_audience, language)
+                if not drugs: drugs = [txt_drugs]
+                
+                ans = analyze_symptom_causality(drugs, symps, v_ctx, target_audience, language)
                 status.update(label="Done", state="complete")
                 
                 st.markdown("---")
