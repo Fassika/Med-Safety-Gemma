@@ -66,11 +66,12 @@ def query_openrouter(model, messages, temperature=0.1):
     }
     
     try:
+        # Increase timeout for large vision models
         response = requests.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers=headers,
             json={"model": model, "messages": messages, "temperature": temperature},
-            timeout=45
+            timeout=55 
         )
         if response.status_code == 200:
             return response.json()['choices'][0]['message']['content'].strip()
@@ -82,8 +83,8 @@ def query_openrouter(model, messages, temperature=0.1):
         return None
 
 # --- 2. Google Native Vision (Primary Eyes) ---
-def get_visual_description_native(image, audience, medical_context):
-    """Try Google Native first with specific medical prompting."""
+def get_visual_description_native(image, audience):
+    """Try Google Native first with descriptive-only prompting."""
     google_key = st.secrets.get("GOOGLE_API_KEY")
     if not google_key: return None
 
@@ -91,16 +92,14 @@ def get_visual_description_native(image, audience, medical_context):
         genai.configure(api_key=google_key)
         model = genai.GenerativeModel('gemini-1.5-flash') 
         
-        # Context-Aware Prompt
-        tone = "clinical dermatology" if audience == "Clinician" else "descriptive medical"
-        prompt = f"""
-        **Role:** Medical Imaging Assistant.
-        **Context:** The patient is taking {medical_context} and suspects a side effect.
-        **Task:** Analyze this image for signs of Adverse Drug Reactions (e.g., maculopapular rash, hives, blistering, angioedema).
-        **Instructions:** 
-        1. Ignore clothing, jewelry, or background details.
-        2. Focus strictly on the skin/lesion morphology (color, texture, distribution).
-        3. Use {tone} terminology.
+        # STRICT DESCRIPTIVE PROMPT
+        prompt = """
+        Analyze this medical image.
+        OUTPUT RULES:
+        1. Describe ONLY the physical appearance (morphology, color, texture, location).
+        2. DO NOT provide a diagnosis (e.g., do not say "This is eczema").
+        3. DO NOT mention drug causes.
+        4. Be precise (e.g., "Erythematous macules," "Raised wheals," "Purpuric spots").
         """
         
         response = model.generate_content([prompt, image])
@@ -109,27 +108,27 @@ def get_visual_description_native(image, audience, medical_context):
         return None
 
 # --- 3. Hybrid Strategy Wrapper ---
-def get_visual_description_hybrid(pil_image, audience, drugs_list, user_feeling):
-    # Construct Context String for the AI
-    medical_context = f"Drugs: {', '.join(drugs_list)}. Symptoms reported: {user_feeling}"
-    
+def get_visual_description_hybrid(pil_image, audience, drugs_list):
     # 1. Try Google Native
-    desc = get_visual_description_native(pil_image, audience, medical_context)
+    desc = get_visual_description_native(pil_image, audience)
     if desc:
         return desc, "Google Native (Gemini Flash)"
     
     # 2. Try OpenRouter Fallbacks
     b64_img = image_to_base64(pil_image)
     
-    # Context-Aware Prompt for Fallback Models
+    # STRICT DESCRIPTIVE PROMPT FOR FALLBACKS
+    # We remove the "user feeling" here to prevent the vision model from hallucinating a diagnosis based on the text.
     prompt = f"""
-    You are a medical AI assistant.
+    You are a medical imaging assistant.
     The patient is taking: {', '.join(drugs_list)}.
-    They report: {user_feeling}.
     
-    Task: Look at this image specifically for clinical signs of a drug reaction (rash, swelling, redness). 
-    CRITICAL: Ignore non-medical details like shirts, wall colors, or jewelry. Focus ONLY on the body/skin.
-    Describe the visual symptoms in detail.
+    TASK: Provide a purely DESCRIPTIVE analysis of the visual symptoms.
+    RESTRICTIONS:
+    1. Do NOT diagnose the condition.
+    2. Do NOT mention specific drugs or causes.
+    3. Describe ONLY visible features: Color (e.g., erythematous), Texture (e.g., raised, blistering), Distribution (e.g., localized, diffuse).
+    4. Ignore clothing and background.
     """
     
     messages = [
@@ -142,11 +141,12 @@ def get_visual_description_hybrid(pil_image, audience, drugs_list, user_feeling)
         }
     ]
     
+    # PRIORITIZED LIST (Research-based + Availability)
     fallback_models = [
-        "meta-llama/llama-3.2-11b-vision-instruct", 
-        "qwen/qwen2.5-vl-32b-instruct",            
-        "google/gemini-flash-1.5",                 
-        "moonshotai/kimi-vl-a3b-thinking"
+        "google/gemini-flash-1.5",                 # 1. Google (If OpenRouter proxy works)
+        "rhymes-ai/ovis-1.6-gemma-2-9b",           # 2. OVIS (Critical: This is a GEMMA-based vision model!)
+        "qwen/qwen2.5-vl-72b-instruct",            # 3. Qwen 2.5 VL (Top Tier Open Source)
+        "meta-llama/llama-3.2-11b-vision-instruct" # 4. Llama 3.2 (Reliable/Fast)
     ]
     
     for model in fallback_models:
@@ -179,15 +179,21 @@ def query_ddi_db(d1, d2):
 
 def analyze_symptom_causality(drugs, symptoms, visual_context, audience, language):
     role = "Empathetic Medical Assistant" if audience == "Patient" else "Clinical Pharmacologist"
+    
+    # Gemma now receives the "Clinical Observation" from the Vision model
+    # and combines it with the Drug Knowledge.
     prompt = f"""
     Role: {role}. Language: {language}.
-    Drugs: {drugs}. Symptoms: {symptoms}.
+    Drugs: {drugs}. Symptoms Reported: {symptoms}.
     
-    **Visual Findings from Image Analysis:** 
+    **Visual Observation (from imaging):** 
     "{visual_context}"
     
     **Task:**
-    Combine the drug info, reported symptoms, and visual findings to assess if this is an Adverse Drug Reaction (ADR).
+    Act as the Doctor.
+    1. Compare the Visual Observation against known side effects of {drugs}.
+    2. Determine if this matches a specific reaction (e.g., Urticaria, SJS, Erythema Multiforme).
+    3. Provide Triage & Recommendations.
     
     **Output:**
     Return: Triage (EMERGENCY/WARNING/MONITOR), Assessment, Recommendation.
@@ -237,20 +243,16 @@ with tab2:
         if not txt_drugs: st.warning("Enter meds.")
         else:
             with st.status("Processing...", expanded=True) as status:
-                # 1. Extract Text Info FIRST (Critical Change)
                 st.write("🧠 Extracting entities...")
                 drugs, symps = extract_entities(txt_drugs)
-                # Combine manual feeling with extracted symptoms
                 if txt_feel: symps.append(txt_feel)
                 
-                # 2. Analyze Image with Context
                 v_ctx = "No image."
                 if img_file:
                     st.write("👁️ Analyzing Image (Hybrid Mode)...")
                     img = Image.open(img_file)
-                    
-                    # Pass the extracted drugs/symptoms to the vision model!
-                    v_desc, source = get_visual_description_hybrid(img, target_audience, drugs, str(symps))
+                    # Pass only drugs, no feeling to vision model to keep it objective
+                    v_desc, source = get_visual_description_hybrid(img, target_audience, drugs)
                     
                     if v_desc:
                         v_ctx = v_desc
@@ -258,8 +260,7 @@ with tab2:
                     else:
                         st.error("Vision analysis failed on all providers.")
                 
-                # 3. Final Synthesis
-                st.write("⚕️ Clinical Synthesis...")
+                st.write("⚕️ Clinical Synthesis (Gemma 2)...")
                 if not drugs: drugs = [txt_drugs]
                 
                 ans = analyze_symptom_causality(drugs, symps, v_ctx, target_audience, language)
