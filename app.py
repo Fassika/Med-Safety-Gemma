@@ -19,7 +19,7 @@ GEMMA_MODEL_ID = "google/gemma-2-9b-it"
 
 # THE EYE: Describes the image
 # Using the stable Flash 1.5 model
-VISION_MODEL_ID = "google/gemini-flash-1.5"
+VISION_MODEL_ID = "google/gemini-flash-1.5-8b"
 
 DATA_REPO_ID = "FassikaF/medical-safety-app-data" 
 DB_FILENAME = "ddi_database.db"
@@ -99,7 +99,8 @@ def query_openrouter(model, messages, temperature=0.1):
 
 def get_visual_description(base64_image, audience):
     """
-    Uses a Vision Model (Gemini Flash) to translate the image into text.
+    Uses a Vision Model to translate the image into text.
+    Includes a fallback mechanism if the primary model is busy.
     """
     tone = "clinical and precise" if audience == "Clinician" else "simple and descriptive"
     prompt = f"Describe the medical symptom in this image in {tone} terms. Focus on visible dermatological or physical signs."
@@ -118,7 +119,26 @@ def get_visual_description(base64_image, audience):
             ]
         }
     ]
-    return query_openrouter(VISION_MODEL_ID, messages, temperature=0.1)
+    
+    # List of models to try in order of preference
+    # 1. Flash 8B (Fastest, newest)
+    # 2. Flash 1.5 (Standard)
+    # 3. Pro 1.5 (Most powerful, slightly slower)
+    models_to_try = [
+        "google/gemini-flash-1.5-8b",
+        "google/gemini-flash-1.5", 
+        "google/gemini-pro-1.5"
+    ]
+
+    for model in models_to_try:
+        try:
+            response = query_openrouter(model, messages, temperature=0.1)
+            if response:
+                return response
+        except Exception:
+            continue # Try the next model silently
+            
+    return None
 
 def extract_entities(text):
     """Uses Gemma to extract clinical entities."""
@@ -332,3 +352,4 @@ with tab2:
                          st.markdown(f'<div class="status-yellow"><h3>⚠️ WARNING - CONSULT DOCTOR</h3>{analysis}</div>', unsafe_allow_html=True)
                     else:
                          st.markdown(f'<div class="status-green"><h3>✅ MONITOR</h3>{analysis}</div>', unsafe_allow_html=True)
+
