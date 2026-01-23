@@ -14,10 +14,12 @@ st.set_page_config(
 )
 
 # --- Configuration ---
-# THE BRAIN: Performs the safety reasoning
+# THE BRAIN: Performs the safety reasoning (Gemma 2)
 GEMMA_MODEL_ID = "google/gemma-2-9b-it" 
-# THE EYE: Describes the image (Using Gemini Flash via OpenRouter for speed/vision)
-VISION_MODEL_ID = "google/gemini-flash-1.5-8b"
+
+# THE EYE: Describes the image
+# Using the stable Flash 1.5 model
+VISION_MODEL_ID = "google/gemini-flash-1.5"
 
 DATA_REPO_ID = "FassikaF/medical-safety-app-data" 
 DB_FILENAME = "ddi_database.db"
@@ -83,6 +85,10 @@ def query_openrouter(model, messages, temperature=0.1):
             headers=headers,
             json=payload
         )
+        if response.status_code == 404:
+            st.error(f"Model error ({model}): The model provider is temporarily unavailable. Try again later.")
+            return None
+            
         response.raise_for_status()
         return response.json()['choices'][0]['message']['content'].strip()
     except Exception as e:
@@ -91,12 +97,12 @@ def query_openrouter(model, messages, temperature=0.1):
 
 # --- Logic Modules ---
 
-def get_visual_description(base64_image):
+def get_visual_description(base64_image, audience):
     """
     Uses a Vision Model (Gemini Flash) to translate the image into text.
-    This text is then passed to Gemma 2 for reasoning.
     """
-    prompt = "Describe the medical symptom in this image in clinical terms (e.g., 'erythematous rash', 'swollen edema'). Be precise but concise."
+    tone = "clinical and precise" if audience == "Clinician" else "simple and descriptive"
+    prompt = f"Describe the medical symptom in this image in {tone} terms. Focus on visible dermatological or physical signs."
     
     messages = [
         {
@@ -112,7 +118,6 @@ def get_visual_description(base64_image):
             ]
         }
     ]
-    # We use Gemini Flash as the 'Eye' because it's fast and in the Google ecosystem
     return query_openrouter(VISION_MODEL_ID, messages, temperature=0.1)
 
 def extract_entities(text):
@@ -126,9 +131,11 @@ def extract_entities(text):
     messages = [{"role": "user", "content": prompt}]
     res = query_openrouter(GEMMA_MODEL_ID, messages, temperature=0.0)
     try:
-        res = res.replace("```json", "").replace("```", "").strip()
-        data = json.loads(res)
-        return data.get("drugs", []), data.get("symptoms", [])
+        if res:
+            res = res.replace("```json", "").replace("```", "").strip()
+            data = json.loads(res)
+            return data.get("drugs", []), data.get("symptoms", [])
+        return [], []
     except:
         return [text], []
 
@@ -142,17 +149,27 @@ def query_ddi_db(drug1, drug2):
     conn.close()
     return res[0] if res else "Unknown"
 
-def analyze_symptom_causality(drugs, symptoms, visual_context=None):
+def analyze_symptom_causality(drugs, symptoms, visual_context, audience, language):
     """
-    Uses Gemma 2 to reason about the relationship between drugs and symptoms.
+    Uses Gemma 2 to reason about the relationship between drugs and symptoms,
+    adjusted for the specific audience.
     """
     
     visual_note = ""
     if visual_context:
-        visual_note = f"**Visual Analysis of Symptom:** {visual_context}"
+        visual_note = f"**Visual Analysis Findings:** {visual_context}"
+
+    # Define Role-Based Instructions
+    if audience == "Patient":
+        role_desc = "Empathetic Medical Assistant"
+        style_guide = "Use simple language (5th-grade level). Avoid jargon. Focus on 'What should I do?' and clear warning signs."
+    else:
+        role_desc = "Clinical Pharmacologist"
+        style_guide = "Use professional medical terminology. Discuss Pharmacokinetics (PK), Pharmacodynamics (PD), differential diagnosis, and clinical management strategies."
 
     prompt = f"""
-    **Role:** Clinical Safety AI (Gemma 2).
+    **Role:** {role_desc} (Powered by Gemma 2).
+    **Language:** {language}
     
     **Scenario:**
     - Current Drugs: {', '.join(drugs)}
@@ -160,28 +177,49 @@ def analyze_symptom_causality(drugs, symptoms, visual_context=None):
     {visual_note}
     
     **Task:** 
-    Determine if the reported symptoms (or visual signs) are a known side effect of the drugs, an allergic reaction, or a medical emergency.
+    Analyze if the reported symptoms (or visual signs) are an adverse drug reaction (ADR), allergy, or emergency.
+    
+    **Style Instructions:** {style_guide}
     
     **Output Logic:**
     1. If signs suggest Stevens-Johnson Syndrome, Anaphylaxis, or severe toxicity -> RETURN "EMERGENCY".
-    2. If signs are common, manageable side effects -> RETURN "MONITOR".
-    3. If unknown or concerning -> RETURN "WARNING".
+    2. If signs are common side effects -> RETURN "MONITOR".
+    3. If unknown/concerning -> RETURN "WARNING".
     
-    **Format:**
-    Provide a structured response:
+    **Required Format:**
     - **Triage:** [EMERGENCY / WARNING / MONITOR]
-    - **Assessment:** Explain *why*. Link the visual signs to the drug mechanism if possible.
-    - **Recommendation:** Actionable advice.
+    - **Assessment:** (Explanation based on audience settings)
+    - **Recommendation:** (Action plan based on audience settings)
     """
     
     messages = [
-        {"role": "system", "content": "You are a safe, evidence-based medical assistant powered by Google Gemma 2."},
+        {"role": "system", "content": f"You are a helpful {role_desc}."},
         {"role": "user", "content": prompt}
     ]
     return query_openrouter(GEMMA_MODEL_ID, messages, temperature=0.2)
 
-def analyze_interaction_report(drug1, drug2, level, language):
-    prompt = f"Create a safety report for {drug1} and {drug2}. Level: {level}. Lang: {language}. Audience: Patient."
+def analyze_interaction_report(drug1, drug2, level, language, audience):
+    """
+    Generates interaction report tailored to audience.
+    """
+    if audience == "Patient":
+        style = "simple, non-medical language. Explain what might feel wrong and when to call a doctor."
+    else:
+        style = "clinical language. Include mechanism of action (e.g., CYP450 inhibition), clinical significance, and monitoring parameters."
+
+    prompt = f"""
+    Create a drug interaction safety report for **{drug1}** and **{drug2}**. 
+    
+    **Data:**
+    - Database Risk Level: {level}
+    - Target Audience: {audience} ({style})
+    - Output Language: {language}
+    
+    **Structure:**
+    1. Summary
+    2. Detailed Explanation (Mechanism or What to feel)
+    3. Action Plan (Management or Next Steps)
+    """
     messages = [{"role": "user", "content": prompt}]
     return query_openrouter(GEMMA_MODEL_ID, messages, temperature=0.2)
 
@@ -190,7 +228,19 @@ def analyze_interaction_report(drug1, drug2, level, language):
 with st.sidebar:
     st.image("https://www.gstatic.com/lamda/images/gemini_sparkle_v002_d4735304ff6292a690345.svg", width=50)
     st.markdown("### Settings")
-    language = st.selectbox("Language", ["English", "Spanish", "French", "Arabic"])
+    
+    # 1. Target Audience Selector
+    target_audience = st.radio(
+        "Target Audience", 
+        ["Patient", "Clinician"], 
+        index=0,
+        help="Patient mode uses simple language. Clinician mode uses technical medical terms."
+    )
+    
+    # 2. Language Selector
+    language = st.selectbox("Language", ["English", "Spanish", "French", "Arabic", "Amharic"])
+    
+    st.markdown("---")
     st.caption(f"Reasoning: **{GEMMA_MODEL_ID}**")
     st.caption(f"Vision: **{VISION_MODEL_ID}**")
 
@@ -200,7 +250,7 @@ tab1, tab2 = st.tabs(["💊 Interaction Checker", "📸 Visual Symptom Analyzer"
 
 # --- TAB 1: INTERACTION CHECKER ---
 with tab1:
-    st.markdown("#### Check drug combinations.")
+    st.markdown(f"#### Check drug combinations ({target_audience} Mode)")
     col1, col2 = st.columns(2)
     with col1: d1_input = st.text_input("First Medication", placeholder="e.g. Warfarin")
     with col2: d2_input = st.text_input("Second Medication", placeholder="e.g. Aspirin")
@@ -209,16 +259,19 @@ with tab1:
         if d1_input and d2_input:
             with st.spinner("Consulting Gemma 2..."):
                 db_level = query_ddi_db(d1_input, d2_input)
-                report = analyze_interaction_report(d1_input, d2_input, db_level, language)
+                # Pass audience settings
+                report = analyze_interaction_report(d1_input, d2_input, db_level, language, target_audience)
+                
                 color = "green"
                 if "major" in db_level.lower(): color = "red"
                 elif "moderate" in db_level.lower(): color = "orange"
+                
                 st.markdown(f"**Risk Level:** :{color}[{db_level.upper()}]")
                 st.success(report)
 
 # --- TAB 2: VISUAL SYMPTOM ANALYZER ---
 with tab2:
-    st.markdown("#### 🛡️ Visual Side Effect Triage")
+    st.markdown(f"#### 🛡️ Visual Side Effect Triage ({target_audience} Mode)")
     st.markdown("Upload a photo of your symptom (e.g., rash, swelling) and list your meds.")
     
     col_input, col_img = st.columns([1, 1])
@@ -247,24 +300,35 @@ with tab2:
                 
                 # Step 2: Visual Processing (Gemini Flash)
                 visual_context = "No image provided."
+                
                 if img_file:
                     st.write("👁️ Vision Model: Analyzing image patterns...")
                     b64_img = encode_image(img_file)
-                    visual_context = get_visual_description(b64_img)
-                    st.info(f"Visual Findings: {visual_context}")
+                    # Pass audience to vision model too (Clinical vs Simple description)
+                    v_desc = get_visual_description(b64_img, target_audience)
+                    if v_desc:
+                        visual_context = v_desc
+                        st.info(f"Visual Findings: {visual_context}")
+                    else:
+                        st.warning("Vision analysis skipped (Service busy).")
                 
                 # Step 3: Synthesis (Gemma)
                 st.write("⚕️ Gemma: Synthesizing clinical assessment...")
                 symptoms_combined = [txt_feel] if txt_feel else []
-                analysis = analyze_symptom_causality(drugs_list, symptoms_combined, visual_context)
+                
+                if not drugs_list: drugs_list = [txt_drugs]
+                
+                # Pass audience settings
+                analysis = analyze_symptom_causality(drugs_list, symptoms_combined, visual_context, target_audience, language)
                 
                 status.update(label="Analysis Complete", state="complete")
                 
                 # Step 4: Display
                 st.markdown("---")
-                if "EMERGENCY" in analysis:
-                    st.markdown(f'<div class="status-red"><h3>🚨 POSSIBLE EMERGENCY</h3>{analysis}</div>', unsafe_allow_html=True)
-                elif "WARNING" in analysis:
-                     st.markdown(f'<div class="status-yellow"><h3>⚠️ WARNING - CONSULT DOCTOR</h3>{analysis}</div>', unsafe_allow_html=True)
-                else:
-                     st.markdown(f'<div class="status-green"><h3>✅ MONITOR</h3>{analysis}</div>', unsafe_allow_html=True)
+                if analysis:
+                    if "EMERGENCY" in analysis:
+                        st.markdown(f'<div class="status-red"><h3>🚨 POSSIBLE EMERGENCY</h3>{analysis}</div>', unsafe_allow_html=True)
+                    elif "WARNING" in analysis:
+                         st.markdown(f'<div class="status-yellow"><h3>⚠️ WARNING - CONSULT DOCTOR</h3>{analysis}</div>', unsafe_allow_html=True)
+                    else:
+                         st.markdown(f'<div class="status-green"><h3>✅ MONITOR</h3>{analysis}</div>', unsafe_allow_html=True)
