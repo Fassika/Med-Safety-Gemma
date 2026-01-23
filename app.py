@@ -5,6 +5,7 @@ import sqlite3
 import google.generativeai as genai
 from PIL import Image
 from pathlib import Path
+import time
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -79,11 +80,10 @@ def query_openrouter(model, messages, temperature=0.1):
         st.error(f"Gemma API Error: {e}")
         return None
 
-# --- UPDATED: Robust Google Native Vision Logic ---
+# --- UPDATED: Auto-Detect Vision Model ---
 def get_visual_description_native(image, audience):
     """
-    Uses Google's Native API for Vision.
-    INCLUDES: Safety Settings Fix & Detailed Error Logging.
+    Uses Google's Native API. Auto-detects the best available model.
     """
     google_key = st.secrets.get("GOOGLE_API_KEY")
     if not google_key:
@@ -93,12 +93,17 @@ def get_visual_description_native(image, audience):
     try:
         genai.configure(api_key=google_key)
         
-        # 1. Define Model
-        # We use the generic 'gemini-1.5-flash' which aliases to the latest stable version
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        # Priority list of models to try
+        # We start with specific versions to avoid ambiguity
+        candidate_models = [
+            'gemini-1.5-flash-latest',
+            'gemini-1.5-flash',
+            'gemini-1.5-flash-001',
+            'gemini-1.5-pro',
+            'gemini-pro-vision' # Old reliable fallback
+        ]
         
-        # 2. Define Safety Settings (CRITICAL FOR MEDICAL IMAGES)
-        # We must disable blocks on "bodily harm" or it will reject rashes/wounds.
+        # Safety settings to allow medical imagery
         safety_settings = [
             {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
             {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
@@ -109,17 +114,29 @@ def get_visual_description_native(image, audience):
         tone = "clinical and precise" if audience == "Clinician" else "simple and descriptive"
         prompt = f"Describe the medical symptom in this image in {tone} terms. Focus on visible dermatological or physical signs. Be concise."
 
-        # 3. Generate
-        response = model.generate_content(
-            [prompt, image],
-            safety_settings=safety_settings
-        )
+        # Try each model until one works
+        for model_name in candidate_models:
+            try:
+                model = genai.GenerativeModel(model_name)
+                response = model.generate_content(
+                    [prompt, image],
+                    safety_settings=safety_settings
+                )
+                return response.text
+            except Exception as e:
+                # If it's a 404 (Not Found), we just continue to the next model
+                if "404" in str(e) or "not found" in str(e).lower():
+                    continue
+                # If it's a safety block, we return that specific error
+                if "finish_reason" in str(e):
+                    return "Analysis blocked by safety filters. Try a clearer image."
+                continue
         
-        return response.text
+        st.error("Could not find a working Google Vision model. Please check API key.")
+        return None
         
     except Exception as e:
-        # Detailed error printing for debugging
-        st.error(f"Google Vision API Error Details: {str(e)}")
+        st.error(f"System Error: {str(e)}")
         return None
 
 # --- Logic Modules ---
@@ -155,7 +172,7 @@ def query_ddi_db(drug1, drug2):
 def analyze_symptom_causality(drugs, symptoms, visual_context, audience, language):
     visual_note = ""
     if visual_context:
-        visual_note = f"**Visual Analysis Findings (from Gemini Flash):** {visual_context}"
+        visual_note = f"**Visual Analysis Findings:** {visual_context}"
 
     if audience == "Patient":
         role_desc = "Empathetic Medical Assistant"
@@ -226,7 +243,7 @@ with st.sidebar:
     language = st.selectbox("Language", ["English", "Spanish", "French", "Arabic", "Amharic"])
     st.markdown("---")
     st.caption(f"Brain: **{GEMMA_MODEL_ID}**")
-    st.caption("Eyes: **Google Gemini Flash 1.5** (Native)")
+    st.caption("Eyes: **Google Gemini (Native)**")
 
 st.markdown('<div class="main-header">🩺 Med-GemMA Safety Hub</div>', unsafe_allow_html=True)
 
@@ -277,7 +294,7 @@ with tab2:
                 
                 visual_context = "No image provided."
                 if img_file:
-                    st.write("👁️ Gemini Flash (Native): Analyzing image patterns...")
+                    st.write("👁️ Gemini Vision: Analyzing image patterns...")
                     try:
                         pil_image = Image.open(img_file)
                         v_desc = get_visual_description_native(pil_image, target_audience)
