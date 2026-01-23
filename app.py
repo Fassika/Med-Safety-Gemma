@@ -1,46 +1,43 @@
 import streamlit as st
 import requests
 import json
-import os
 import sqlite3
+import base64
 from pathlib import Path
 
 # --- Page Configuration ---
 st.set_page_config(
-    page_title="🩺 Med-GemMA Safety Assistant",
+    page_title="🩺 Med-GemMA Safety",
     page_icon="🛡️",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# --- Configuration & Constants ---
-# CRITICAL: We are using Google's Gemma 2 model to meet competition criteria.
-# We use the 9B parameter model for a balance of speed and medical reasoning.
+# --- Configuration ---
+# THE BRAIN: Performs the safety reasoning
 GEMMA_MODEL_ID = "google/gemma-2-9b-it" 
+# THE EYE: Describes the image (Using Gemini Flash via OpenRouter for speed/vision)
+VISION_MODEL_ID = "google/gemini-flash-1.5-8b"
+
 DATA_REPO_ID = "FassikaF/medical-safety-app-data" 
 DB_FILENAME = "ddi_database.db"
 
-# --- CSS for UI Polish ---
+# --- CSS / UI Styling ---
 st.markdown("""
     <style>
-    .reportview-container { margin-top: -2em; }
-    .stDeployButton {display:none;}
-    footer {visibility: hidden;}
-    .main-header {font-size: 2.5rem; color: #4285F4; font-weight: 700;} 
-    .sub-header {font-size: 1.5rem; color: #333;}
-    .risk-high {color: #d32f2f; font-weight: bold;}
-    .risk-mod {color: #f57c00; font-weight: bold;}
-    .risk-low {color: #388e3c; font-weight: bold;}
+    .main-header {font-size: 2rem; color: #4285F4; font-weight: 700;} 
+    .status-red {background-color: #ffebee; border-left: 5px solid #d32f2f; padding: 15px; border-radius: 5px; color: #b71c1c;}
+    .status-yellow {background-color: #fff3e0; border-left: 5px solid #f57c00; padding: 15px; border-radius: 5px; color: #e65100;}
+    .status-green {background-color: #e8f5e9; border-left: 5px solid #388e3c; padding: 15px; border-radius: 5px; color: #1b5e20;}
+    .vision-box {border: 1px dashed #4285F4; padding: 10px; border-radius: 10px; background-color: #f8f9fa;}
     </style>
 """, unsafe_allow_html=True)
 
 # --- Helper Functions ---
 def download_file_from_hf(repo_id: str, filename: str, dest_path: str = "."):
-    """Downloads database from Hugging Face if not present."""
     local_path = Path(dest_path) / filename
     if local_path.exists():
         return str(local_path)
-    
     url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{filename}"
     try:
         with requests.get(url, stream=True) as r:
@@ -50,18 +47,20 @@ def download_file_from_hf(repo_id: str, filename: str, dest_path: str = "."):
                     f.write(chunk)
         return str(local_path)
     except Exception as e:
-        st.error(f"Failed to download {filename}: {e}")
         return None
 
 db_path = download_file_from_hf(DATA_REPO_ID, DB_FILENAME)
 
-def query_openrouter_gemma(messages, temperature=0.1):
-    """
-    Wrapper for OpenRouter API specifically targeting Google Gemma 2.
-    """
+def encode_image(uploaded_file):
+    """Encodes streamlit uploaded file to base64 string."""
+    if uploaded_file is None:
+        return None
+    return base64.b64encode(uploaded_file.getvalue()).decode('utf-8')
+
+def query_openrouter(model, messages, temperature=0.1):
     api_key = st.secrets.get("OPENROUTER_API_KEY")
     if not api_key:
-        st.error("🚨 API Key Missing. Please set OPENROUTER_API_KEY in secrets.")
+        st.error("🚨 API Key Missing.")
         return None
 
     headers = {
@@ -72,7 +71,7 @@ def query_openrouter_gemma(messages, temperature=0.1):
     }
     
     payload = {
-        "model": GEMMA_MODEL_ID, # COMPETITION REQUIREMENT: Using Gemma
+        "model": model,
         "messages": messages,
         "temperature": temperature,
         "max_tokens": 1000
@@ -87,146 +86,185 @@ def query_openrouter_gemma(messages, temperature=0.1):
         response.raise_for_status()
         return response.json()['choices'][0]['message']['content'].strip()
     except Exception as e:
-        st.error(f"Gemma API Error: {e}")
+        st.error(f"API Error ({model}): {e}")
         return None
 
-# --- Core Logic: Gemma-Powered Extraction & Analysis ---
+# --- Logic Modules ---
 
-def extract_medications_with_gemma(text):
+def get_visual_description(base64_image):
     """
-    Uses Gemma 2 to extract medication names. 
-    Replaces the heavy 'd4data' NER pipeline for better performance and reasoning.
+    Uses a Vision Model (Gemini Flash) to translate the image into text.
+    This text is then passed to Gemma 2 for reasoning.
     """
-    if not text.strip():
-        return []
-        
-    prompt = f"""
-    Analyze the following text and extract all pharmaceutical drug names, brand names, or active ingredients.
-    Return ONLY a valid JSON list of strings. Do not add markdown formatting or explanation.
-    
-    Text: "{text}"
-    """
+    prompt = "Describe the medical symptom in this image in clinical terms (e.g., 'erythematous rash', 'swollen edema'). Be precise but concise."
     
     messages = [
-        {"role": "system", "content": "You are a precise medical entity extractor. Output JSON only."},
-        {"role": "user", "content": prompt}
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/jpeg;base64,{base64_image}"
+                    }
+                }
+            ]
+        }
     ]
-    
-    response = query_openrouter_gemma(messages, temperature=0.0)
-    
+    # We use Gemini Flash as the 'Eye' because it's fast and in the Google ecosystem
+    return query_openrouter(VISION_MODEL_ID, messages, temperature=0.1)
+
+def extract_entities(text):
+    """Uses Gemma to extract clinical entities."""
+    if not text.strip(): return []
+    prompt = f"""
+    Extract medical entities from the text: "{text}".
+    Return a JSON object with two keys: "drugs" (list) and "symptoms" (list).
+    Example: {{"drugs": ["Advil"], "symptoms": ["headache"]}}
+    """
+    messages = [{"role": "user", "content": prompt}]
+    res = query_openrouter(GEMMA_MODEL_ID, messages, temperature=0.0)
     try:
-        # Clean potential markdown code blocks if Gemma adds them
-        cleaned = response.replace("```json", "").replace("```", "").strip()
-        return json.loads(cleaned)
+        res = res.replace("```json", "").replace("```", "").strip()
+        data = json.loads(res)
+        return data.get("drugs", []), data.get("symptoms", [])
     except:
-        # Fallback if JSON fails
-        return [w.strip() for w in response.split(',')]
+        return [text], []
 
 def query_ddi_db(drug1, drug2):
-    """Queries the local SQLite database for known interactions."""
-    if not db_path: return None
+    if not db_path: return "Unknown"
     conn = sqlite3.connect(db_path)
     c = conn.cursor()
-    # Check both permutations
     q = "SELECT level FROM ddi_interactions WHERE (LOWER(drug1)=? AND LOWER(drug2)=?) OR (LOWER(drug1)=? AND LOWER(drug2)=?)"
     c.execute(q, (drug1.lower(), drug2.lower(), drug2.lower(), drug1.lower()))
     res = c.fetchone()
     conn.close()
     return res[0] if res else "Unknown"
 
-def generate_gemma_analysis(drug1, drug2, db_level, target_audience, language):
+def analyze_symptom_causality(drugs, symptoms, visual_context=None):
     """
-    Generates the final report using Gemma 2, adapting tone based on audience.
+    Uses Gemma 2 to reason about the relationship between drugs and symptoms.
     """
     
-    role_instruction = ""
-    if target_audience == "Patient":
-        role_instruction = "Explain this in simple, non-medical language (5th-grade reading level). Focus on 'What should I do?' and warning signs."
-    else:
-        role_instruction = "Provide a clinical pharmacological consult suitable for a physician. Include mechanism of action and monitoring parameters."
+    visual_note = ""
+    if visual_context:
+        visual_note = f"**Visual Analysis of Symptom:** {visual_context}"
 
     prompt = f"""
-    Analyze the interaction between **{drug1}** and **{drug2}**.
+    **Role:** Clinical Safety AI (Gemma 2).
     
-    **Database Flag:** The interaction database lists the severity as: "{db_level}".
+    **Scenario:**
+    - Current Drugs: {', '.join(drugs)}
+    - Reported Symptoms: {', '.join(symptoms)}
+    {visual_note}
     
-    **Instructions:**
-    1. {role_instruction}
-    2. Provide the response in {language}.
-    3. Structure the response clearly (Summary, Risks, Action Steps).
-    4. If the database level is 'Unknown', rely on your internal medical knowledge to assess the risk, but clearly state that this is AI-generated advice.
+    **Task:** 
+    Determine if the reported symptoms (or visual signs) are a known side effect of the drugs, an allergic reaction, or a medical emergency.
+    
+    **Output Logic:**
+    1. If signs suggest Stevens-Johnson Syndrome, Anaphylaxis, or severe toxicity -> RETURN "EMERGENCY".
+    2. If signs are common, manageable side effects -> RETURN "MONITOR".
+    3. If unknown or concerning -> RETURN "WARNING".
+    
+    **Format:**
+    Provide a structured response:
+    - **Triage:** [EMERGENCY / WARNING / MONITOR]
+    - **Assessment:** Explain *why*. Link the visual signs to the drug mechanism if possible.
+    - **Recommendation:** Actionable advice.
     """
     
     messages = [
-        {"role": "system", "content": "You are an expert medical safety assistant powered by Google Gemma 2. You prioritize patient safety and evidence-based answers."},
+        {"role": "system", "content": "You are a safe, evidence-based medical assistant powered by Google Gemma 2."},
         {"role": "user", "content": prompt}
     ]
-    
-    return query_openrouter_gemma(messages, temperature=0.2)
+    return query_openrouter(GEMMA_MODEL_ID, messages, temperature=0.2)
 
-# --- Sidebar Controls ---
+def analyze_interaction_report(drug1, drug2, level, language):
+    prompt = f"Create a safety report for {drug1} and {drug2}. Level: {level}. Lang: {language}. Audience: Patient."
+    messages = [{"role": "user", "content": prompt}]
+    return query_openrouter(GEMMA_MODEL_ID, messages, temperature=0.2)
+
+# --- Main App UI ---
+
 with st.sidebar:
     st.image("https://www.gstatic.com/lamda/images/gemini_sparkle_v002_d4735304ff6292a690345.svg", width=50)
-    st.header("Settings")
-    target_audience = st.radio("Target Audience", ["Clinician", "Patient"], help="Adjusts the complexity of the explanation.")
-    language = st.selectbox("Output Language", ["English", "Spanish", "French", "Amharic", "Arabic"])
-    st.markdown("---")
-    st.caption(f"Powered by **{GEMMA_MODEL_ID}**")
-    st.caption("Participating in Google Med-GemMA Impact Challenge")
+    st.markdown("### Settings")
+    language = st.selectbox("Language", ["English", "Spanish", "French", "Arabic"])
+    st.caption(f"Reasoning: **{GEMMA_MODEL_ID}**")
+    st.caption(f"Vision: **{VISION_MODEL_ID}**")
 
-# --- Main Interface ---
-st.markdown('<div class="main-header">🩺 Med-GemMA Safety Assistant</div>', unsafe_allow_html=True)
-st.markdown("### AI-Powered Drug Interaction Checker")
+st.markdown('<div class="main-header">🩺 Med-GemMA Safety Hub</div>', unsafe_allow_html=True)
 
-col1, col2 = st.columns(2)
-with col1:
-    st.subheader("Current Medication Profile")
-    current_text = st.text_area("List current drugs", height=100, placeholder="e.g. Warfarin, Lisinopril...")
-with col2:
-    st.subheader("New Prescription / Addition")
-    new_text = st.text_area("Drug to add", height=100, placeholder="e.g. Aspirin, Ibuprofen...")
+tab1, tab2 = st.tabs(["💊 Interaction Checker", "📸 Visual Symptom Analyzer"])
 
-if st.button("🚀 Analyze Interaction", type="primary", use_container_width=True):
-    if not current_text or not new_text:
-        st.warning("Please enter medications in both fields.")
-    else:
-        with st.status("Processing with Gemma 2...", expanded=True) as status:
-            # Step 1: NER with Gemma
-            st.write("🧠 Extracting entities using Gemma 2...")
-            current_drugs = extract_medications_with_gemma(current_text)
-            new_drugs = extract_medications_with_gemma(new_text)
-            
-            if not current_drugs or not new_drugs:
-                status.update(label="Extraction failed", state="error")
-                st.error("Could not identify specific drug names. Please check spelling.")
-            else:
-                st.write(f"✅ Identified: {current_drugs} + {new_drugs}")
+# --- TAB 1: INTERACTION CHECKER ---
+with tab1:
+    st.markdown("#### Check drug combinations.")
+    col1, col2 = st.columns(2)
+    with col1: d1_input = st.text_input("First Medication", placeholder="e.g. Warfarin")
+    with col2: d2_input = st.text_input("Second Medication", placeholder="e.g. Aspirin")
+        
+    if st.button("Check Interactions", key="btn_interact"):
+        if d1_input and d2_input:
+            with st.spinner("Consulting Gemma 2..."):
+                db_level = query_ddi_db(d1_input, d2_input)
+                report = analyze_interaction_report(d1_input, d2_input, db_level, language)
+                color = "green"
+                if "major" in db_level.lower(): color = "red"
+                elif "moderate" in db_level.lower(): color = "orange"
+                st.markdown(f"**Risk Level:** :{color}[{db_level.upper()}]")
+                st.success(report)
+
+# --- TAB 2: VISUAL SYMPTOM ANALYZER ---
+with tab2:
+    st.markdown("#### 🛡️ Visual Side Effect Triage")
+    st.markdown("Upload a photo of your symptom (e.g., rash, swelling) and list your meds.")
+    
+    col_input, col_img = st.columns([1, 1])
+    
+    with col_input:
+        st.subheader("1. What are you taking?")
+        txt_drugs = st.text_area("Medication List", height=100, placeholder="e.g. Lamotrigine, Penicillin")
+        st.subheader("2. Describe feeling (Optional)")
+        txt_feel = st.text_area("Description", height=100, placeholder="e.g. Itchy, burning sensation")
+    
+    with col_img:
+        st.subheader("3. Upload Photo (Optional)")
+        img_file = st.file_uploader("Upload Image", type=["jpg", "png", "jpeg"])
+        if img_file:
+            st.image(img_file, caption="Uploaded Symptom", width=250)
+
+    if st.button("Analyze Safety", key="btn_visual"):
+        if not txt_drugs:
+            st.warning("Please enter your medications.")
+        else:
+            with st.status("Running Multimodal Analysis...", expanded=True) as status:
                 
-                # Step 2: Analysis Loop
-                st.write("🔎 Querying Database & Generating Reports...")
+                # Step 1: Text Extraction (Gemma)
+                st.write("🧠 Gemma: Extracting medication names...")
+                drugs_list, _ = extract_entities(txt_drugs)
+                
+                # Step 2: Visual Processing (Gemini Flash)
+                visual_context = "No image provided."
+                if img_file:
+                    st.write("👁️ Vision Model: Analyzing image patterns...")
+                    b64_img = encode_image(img_file)
+                    visual_context = get_visual_description(b64_img)
+                    st.info(f"Visual Findings: {visual_context}")
+                
+                # Step 3: Synthesis (Gemma)
+                st.write("⚕️ Gemma: Synthesizing clinical assessment...")
+                symptoms_combined = [txt_feel] if txt_feel else []
+                analysis = analyze_symptom_causality(drugs_list, symptoms_combined, visual_context)
+                
                 status.update(label="Analysis Complete", state="complete")
                 
+                # Step 4: Display
                 st.markdown("---")
-                
-                # Cross-check logic
-                found_interactions = False
-                for d1 in current_drugs:
-                    for d2 in new_drugs:
-                        db_level = query_ddi_db(d1, d2)
-                        
-                        # Visual cues for severity
-                        color_class = "risk-low"
-                        if "major" in db_level.lower(): color_class = "risk-high"
-                        elif "moderate" in db_level.lower(): color_class = "risk-mod"
-                        
-                        st.markdown(f"#### Interaction: {d1.title()} ↔ {d2.title()}")
-                        st.markdown(f"**Database Severity:** <span class='{color_class}'>{db_level.upper()}</span>", unsafe_allow_html=True)
-                        
-                        # Step 3: Generate Explanation
-                        analysis = generate_gemma_analysis(d1, d2, db_level, target_audience, language)
-                        st.info(analysis)
-                        found_interactions = True
-                        st.markdown("---")
-
-                if not found_interactions:
-                    st.success("No interactions found between the identified drugs.")
+                if "EMERGENCY" in analysis:
+                    st.markdown(f'<div class="status-red"><h3>🚨 POSSIBLE EMERGENCY</h3>{analysis}</div>', unsafe_allow_html=True)
+                elif "WARNING" in analysis:
+                     st.markdown(f'<div class="status-yellow"><h3>⚠️ WARNING - CONSULT DOCTOR</h3>{analysis}</div>', unsafe_allow_html=True)
+                else:
+                     st.markdown(f'<div class="status-green"><h3>✅ MONITOR</h3>{analysis}</div>', unsafe_allow_html=True)
