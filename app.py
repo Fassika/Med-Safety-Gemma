@@ -7,6 +7,7 @@ from PIL import Image
 from pathlib import Path
 import io
 import base64
+import time
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -49,10 +50,13 @@ db_path = download_file_from_hf(DATA_REPO_ID, DB_FILENAME)
 def image_to_base64(pil_image):
     """Convert PIL image to base64 for OpenRouter fallback"""
     buffered = io.BytesIO()
+    # Convert RGBA to RGB if necessary
+    if pil_image.mode == 'RGBA':
+        pil_image = pil_image.convert('RGB')
     pil_image.save(buffered, format="JPEG")
     return base64.b64encode(buffered.getvalue()).decode('utf-8')
 
-# --- 1. OpenRouter (The "Brain" & Backup "Eyes") ---
+# --- 1. OpenRouter (The Brain & Backup Eyes) ---
 def query_openrouter(model, messages, temperature=0.1):
     api_key = st.secrets.get("OPENROUTER_API_KEY")
     if not api_key: return None
@@ -64,28 +68,24 @@ def query_openrouter(model, messages, temperature=0.1):
         "X-Title": "Med-GemMA Safety"
     }
     
-    # Retry logic for "Service Busy" errors
-    max_retries = 3
-    for i in range(max_retries):
-        try:
-            response = requests.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers=headers,
-                json={"model": model, "messages": messages, "temperature": temperature},
-                timeout=30
-            )
-            if response.status_code == 200:
-                return response.json()['choices'][0]['message']['content'].strip()
-            elif response.status_code in [429, 503, 502]: # Busy/Rate Limit
-                time.sleep(1) # Wait 1s and retry
-                continue
-            else:
-                return None
-        except:
-            continue
-    return None
+    try:
+        response = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers=headers,
+            json={"model": model, "messages": messages, "temperature": temperature},
+            timeout=45 # Increased timeout for vision models
+        )
+        if response.status_code == 200:
+            return response.json()['choices'][0]['message']['content'].strip()
+        else:
+            # Print error to console for debugging
+            print(f"Model {model} failed with status {response.status_code}: {response.text}")
+            return None
+    except Exception as e:
+        print(f"Exception on {model}: {e}")
+        return None
 
-# --- 2. Google Native Vision (Primary "Eyes") ---
+# --- 2. Google Native Vision (Primary Eyes) ---
 def get_visual_description_native(image, audience):
     """Try Google Native first. Return None if it fails."""
     google_key = st.secrets.get("GOOGLE_API_KEY")
@@ -93,27 +93,22 @@ def get_visual_description_native(image, audience):
 
     try:
         genai.configure(api_key=google_key)
-        # Try the most stable model alias
         model = genai.GenerativeModel('gemini-1.5-flash') 
-        
         tone = "clinical" if audience == "Clinician" else "simple"
         prompt = f"Describe the medical symptom in this image in {tone} terms. Focus on visible dermatological or physical signs."
-
         response = model.generate_content([prompt, image])
         return response.text
-    except Exception as e:
-        print(f"Native Vision Failed: {e}") # Log to console
+    except Exception:
         return None
 
-# --- 3. Hybrid Strategy Wrapper ---
+# --- 3. Hybrid Strategy Wrapper (Updated with New Models) ---
 def get_visual_description_hybrid(pil_image, audience):
-    # ATTEMPT 1: Google Native (Best Points)
+    # 1. Try Google Native (Best Points)
     desc = get_visual_description_native(pil_image, audience)
     if desc:
         return desc, "Google Native (Gemini Flash)"
     
-    # ATTEMPT 2: OpenRouter Backup (Reliability)
-    # We use the 8B model which is less busy
+    # 2. Try OpenRouter Fallbacks
     b64_img = image_to_base64(pil_image)
     tone = "clinical" if audience == "Clinician" else "simple"
     prompt = f"Describe the medical symptom in this image in {tone} terms. Focus on visible dermatological or physical signs."
@@ -128,15 +123,22 @@ def get_visual_description_hybrid(pil_image, audience):
         }
     ]
     
-    # Fallback models
-    fallback_models = ["google/gemini-flash-1.5-8b", "google/gemini-flash-1.5"]
+    # The List of Models to Try (In order of reliability/preference)
+    fallback_models = [
+        "meta-llama/llama-3.2-11b-vision-instruct", # Best fallback (Fast, Open)
+        "qwen/qwen2.5-vl-32b-instruct",            # Very Strong Vision
+        "google/gemini-flash-1.5",                 # Google via OpenRouter
+        "moonshotai/kimi-vl-a3b-thinking",         # Alternative
+        "google/gemma-3-4b-it"                     # As requested (if available)
+    ]
     
     for model in fallback_models:
+        st.write(f"🔄 Trying model: `{model}`...") # Visual feedback for user
         desc = query_openrouter(model, messages)
         if desc:
-            return desc, f"OpenRouter Fallback ({model})"
+            return desc, f"OpenRouter ({model})"
             
-    return None, "Failed"
+    return None, "All Providers Failed"
 
 # --- Logic Modules ---
 def extract_entities(text):
