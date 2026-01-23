@@ -15,9 +15,7 @@ st.set_page_config(
 )
 
 # --- Configuration ---
-# THE BRAIN: Gemma 2 via OpenRouter 
 GEMMA_MODEL_ID = "google/gemma-2-9b-it" 
-
 DATA_REPO_ID = "FassikaF/medical-safety-app-data" 
 DB_FILENAME = "ddi_database.db"
 
@@ -50,9 +48,6 @@ def download_file_from_hf(repo_id: str, filename: str, dest_path: str = "."):
 db_path = download_file_from_hf(DATA_REPO_ID, DB_FILENAME)
 
 def query_openrouter(model, messages, temperature=0.1):
-    """
-    Used ONLY for Gemma 2 (Text/Reasoning)
-    """
     api_key = st.secrets.get("OPENROUTER_API_KEY")
     if not api_key:
         st.error("🚨 OpenRouter API Key Missing.")
@@ -84,39 +79,49 @@ def query_openrouter(model, messages, temperature=0.1):
         st.error(f"Gemma API Error: {e}")
         return None
 
-# --- NEW: Google Native Vision Logic ---
+# --- UPDATED: Robust Google Native Vision Logic ---
 def get_visual_description_native(image, audience):
     """
-    Uses Google's Native API (google-generativeai) for Vision.
-    No OpenRouter dependency for this part.
+    Uses Google's Native API for Vision with fallback model names.
     """
     google_key = st.secrets.get("GOOGLE_API_KEY")
     if not google_key:
-        st.error("🚨 GOOGLE_API_KEY missing in secrets. Please add it to use Vision features.")
+        st.error("🚨 GOOGLE_API_KEY missing in secrets.")
         return None
 
     try:
-        # Configure the library
         genai.configure(api_key=google_key)
         
-        # Use the latest Flash model
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        # List of potential model names to try (Solves the 404 error)
+        model_names = [
+            'gemini-1.5-flash',
+            'gemini-1.5-flash-latest',
+            'gemini-1.5-flash-001',
+            'gemini-pro-vision' # Ultimate fallback
+        ]
         
         tone = "clinical and precise" if audience == "Clinician" else "simple and descriptive"
         prompt = f"Describe the medical symptom in this image in {tone} terms. Focus on visible dermatological or physical signs. Be concise."
+
+        # Loop through models until one works
+        for m_name in model_names:
+            try:
+                model = genai.GenerativeModel(m_name)
+                response = model.generate_content([prompt, image])
+                return response.text
+            except Exception:
+                continue # Try next model
         
-        # Call Google directly
-        response = model.generate_content([prompt, image])
-        return response.text
+        st.error("Could not connect to any Google Vision models. Please check API Key permissions.")
+        return None
         
     except Exception as e:
-        st.error(f"Google Vision API Error: {e}")
+        st.error(f"Google Vision API Critical Error: {e}")
         return None
 
 # --- Logic Modules ---
 
 def extract_entities(text):
-    """Uses Gemma to extract clinical entities."""
     if not text.strip(): return []
     prompt = f"""
     Extract medical entities from the text: "{text}".
@@ -145,21 +150,16 @@ def query_ddi_db(drug1, drug2):
     return res[0] if res else "Unknown"
 
 def analyze_symptom_causality(drugs, symptoms, visual_context, audience, language):
-    """
-    Uses Gemma 2 to reason about the relationship between drugs and symptoms.
-    """
-    
     visual_note = ""
     if visual_context:
         visual_note = f"**Visual Analysis Findings (from Gemini Flash):** {visual_context}"
 
-    # Define Role-Based Instructions
     if audience == "Patient":
         role_desc = "Empathetic Medical Assistant"
-        style_guide = "Use simple language (5th-grade level). Avoid jargon. Focus on 'What should I do?' and clear warning signs."
+        style_guide = "Use simple language (5th-grade level). Avoid jargon. Focus on 'What should I do?'."
     else:
         role_desc = "Clinical Pharmacologist"
-        style_guide = "Use professional medical terminology. Discuss Pharmacokinetics (PK), Pharmacodynamics (PD), differential diagnosis, and clinical management strategies."
+        style_guide = "Use professional medical terminology. Discuss Pharmacokinetics (PK), Pharmacodynamics (PD)."
 
     prompt = f"""
     **Role:** {role_desc} (Powered by Gemma 2).
@@ -193,13 +193,10 @@ def analyze_symptom_causality(drugs, symptoms, visual_context, audience, languag
     return query_openrouter(GEMMA_MODEL_ID, messages, temperature=0.2)
 
 def analyze_interaction_report(drug1, drug2, level, language, audience):
-    """
-    Generates interaction report tailored to audience.
-    """
     if audience == "Patient":
-        style = "simple, non-medical language. Explain what might feel wrong and when to call a doctor."
+        style = "simple, non-medical language."
     else:
-        style = "clinical language. Include mechanism of action (e.g., CYP450 inhibition), clinical significance, and monitoring parameters."
+        style = "clinical language, mechanism of action."
 
     prompt = f"""
     Create a drug interaction safety report for **{drug1}** and **{drug2}**. 
@@ -211,8 +208,8 @@ def analyze_interaction_report(drug1, drug2, level, language, audience):
     
     **Structure:**
     1. Summary
-    2. Detailed Explanation (Mechanism or What to feel)
-    3. Action Plan (Management or Next Steps)
+    2. Detailed Explanation
+    3. Action Plan
     """
     messages = [{"role": "user", "content": prompt}]
     return query_openrouter(GEMMA_MODEL_ID, messages, temperature=0.2)
@@ -222,10 +219,8 @@ def analyze_interaction_report(drug1, drug2, level, language, audience):
 with st.sidebar:
     st.image("https://www.gstatic.com/lamda/images/gemini_sparkle_v002_d4735304ff6292a690345.svg", width=50)
     st.markdown("### Settings")
-    
     target_audience = st.radio("Target Audience", ["Patient", "Clinician"], index=0)
     language = st.selectbox("Language", ["English", "Spanish", "French", "Arabic", "Amharic"])
-    
     st.markdown("---")
     st.caption(f"Brain: **{GEMMA_MODEL_ID}**")
     st.caption("Eyes: **Google Gemini Flash 1.5** (Native)")
@@ -234,7 +229,7 @@ st.markdown('<div class="main-header">🩺 Med-GemMA Safety Hub</div>', unsafe_a
 
 tab1, tab2 = st.tabs(["💊 Interaction Checker", "📸 Visual Symptom Analyzer"])
 
-# --- TAB 1: INTERACTION CHECKER ---
+# --- TAB 1 ---
 with tab1:
     st.markdown(f"#### Check drug combinations ({target_audience} Mode)")
     col1, col2 = st.columns(2)
@@ -246,19 +241,15 @@ with tab1:
             with st.spinner("Consulting Gemma 2..."):
                 db_level = query_ddi_db(d1_input, d2_input)
                 report = analyze_interaction_report(d1_input, d2_input, db_level, language, target_audience)
-                
                 color = "green"
                 if "major" in db_level.lower(): color = "red"
                 elif "moderate" in db_level.lower(): color = "orange"
-                
                 st.markdown(f"**Risk Level:** :{color}[{db_level.upper()}]")
                 st.success(report)
 
-# --- TAB 2: VISUAL SYMPTOM ANALYZER ---
+# --- TAB 2 ---
 with tab2:
     st.markdown(f"#### 🛡️ Visual Side Effect Triage ({target_audience} Mode)")
-    st.markdown("Upload a photo of your symptom (e.g., rash, swelling) and list your meds.")
-    
     col_input, col_img = st.columns([1, 1])
     
     with col_input:
@@ -278,18 +269,13 @@ with tab2:
             st.warning("Please enter your medications.")
         else:
             with st.status("Running Multimodal Analysis...", expanded=True) as status:
-                
-                # Step 1: Text Extraction (Gemma)
                 st.write("🧠 Gemma: Extracting medication names...")
                 drugs_list, _ = extract_entities(txt_drugs)
                 
-                # Step 2: Visual Processing (Google Native)
                 visual_context = "No image provided."
-                
                 if img_file:
                     st.write("👁️ Gemini Flash (Native): Analyzing image patterns...")
                     try:
-                        # Convert uploaded file to PIL Image for Google SDK
                         pil_image = Image.open(img_file)
                         v_desc = get_visual_description_native(pil_image, target_audience)
                         if v_desc:
@@ -300,7 +286,6 @@ with tab2:
                     except Exception as e:
                         st.error(f"Image processing failed: {e}")
                 
-                # Step 3: Synthesis (Gemma)
                 st.write("⚕️ Gemma: Synthesizing clinical assessment...")
                 symptoms_combined = [txt_feel] if txt_feel else []
                 if not drugs_list: drugs_list = [txt_drugs]
@@ -309,7 +294,6 @@ with tab2:
                 
                 status.update(label="Analysis Complete", state="complete")
                 
-                # Step 4: Display
                 st.markdown("---")
                 if analysis:
                     if "EMERGENCY" in analysis:
