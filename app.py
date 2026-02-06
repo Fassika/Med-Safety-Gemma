@@ -343,3 +343,4 @@ with tab2:
                     if "EMERGENCY" in ans: color = "status-red"
                     elif "WARNING" in ans: color = "status-yellow"
                     st.markdown(f'<div class="{color}">{ans}</div>', unsafe_allow_html=True)
+
