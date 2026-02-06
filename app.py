@@ -8,7 +8,7 @@ from pathlib import Path
 import io
 import base64
 import time
-import itertools  # NEW: For generating drug pairs
+import itertools  
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -343,4 +343,5 @@ with tab2:
                     if "EMERGENCY" in ans: color = "status-red"
                     elif "WARNING" in ans: color = "status-yellow"
                     st.markdown(f'<div class="{color}">{ans}</div>', unsafe_allow_html=True)
+
 
