@@ -2,7 +2,7 @@ import streamlit as st
 import requests
 import json
 import sqlite3
-import google.generativeai as genai
+import google.genai as genai
 from PIL import Image
 from pathlib import Path
 import io
